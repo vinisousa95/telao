@@ -1,0 +1,26 @@
+# Serviço systemd para rodar o monitor automaticamente na inicialização.
+#
+# Instalação:
+#   sudo cp telao-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telao-monitor
+#
+# Logs:
+#   journalctl -u telao-monitor -f
+
+[Unit]
+Description=Monitor de Telão - mantém o browser na página correta
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=USUARIO_AQUI
+WorkingDirectory=/home/USUARIO_AQUI/telao
+ExecStart=/home/USUARIO_AQUI/telao/.venv/bin/python /home/USUARIO_AQUI/telao/monitor.py
+Restart=always
+RestartSec=15
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=graphical.target
