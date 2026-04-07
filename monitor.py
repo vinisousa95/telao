@@ -53,6 +53,8 @@ if not TARGET_URL:
 # ── Sinal de parada ──────────────────────────────────────────────────────────
 _running = True
 _edge_proc = None
+_last_recovery = 0
+RECOVERY_COOLDOWN = 60  # segundos entre tentativas de recuperação
 
 def _stop(signum, frame):
     global _running
@@ -128,8 +130,19 @@ def navigate_cdp(ws_url, url):
     time.sleep(3)
 
 # ── Edge: inicia e verifica ───────────────────────────────────────────────────
+def kill_edge():
+    """Mata todos os processos msedge.exe existentes."""
+    try:
+        subprocess.call(["taskkill", "/f", "/im", "msedge.exe"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        log.info("Processos Edge encerrados.")
+    except Exception:
+        pass
+
 def start_edge():
     global _edge_proc
+    kill_edge()
     edge_exe = find_edge()
     log.info("Iniciando Edge: %s", edge_exe)
     _edge_proc = subprocess.Popen([
@@ -216,9 +229,16 @@ def current_url_matches():
     return match
 
 def recover():
+    global _last_recovery
+    now = time.time()
+    if now - _last_recovery < RECOVERY_COOLDOWN:
+        log.debug("Aguardando cooldown de recuperação...")
+        return False
+    _last_recovery = now
+
     log.info("=== Iniciando recuperação ===")
 
-    # Tenta ir direto para o alvo
+    # Tenta ir direto para o alvo (sem login)
     tab = get_page_tab()
     if tab:
         navigate_cdp(tab["webSocketDebuggerUrl"], TARGET_URL)
@@ -226,7 +246,7 @@ def recover():
             log.info("Recuperado sem login.")
             return True
 
-    # Faz login e vai ao alvo
+    # Precisa de login
     do_login()
     time.sleep(2)
     tab = get_page_tab()
