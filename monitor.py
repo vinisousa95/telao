@@ -1,7 +1,6 @@
 """
 Monitor de Telão - CDP edition
-Controla o Edge via Chrome DevTools Protocol (porta 9222).
-Não precisa de driver externo nem download adicional.
+Controla o Edge via Chrome DevTools Protocol sem precisar de driver externo.
 """
 
 import os
@@ -39,11 +38,11 @@ USERNAME          = os.getenv("TELAO_USERNAME", "")
 PASSWORD          = os.getenv("TELAO_PASSWORD", "")
 USERNAME_SELECTOR = os.getenv("USERNAME_SELECTOR", 'input[name="login"]')
 PASSWORD_SELECTOR = os.getenv("PASSWORD_SELECTOR", 'input[name="senha"]')
-SUBMIT_SELECTOR   = os.getenv("SUBMIT_SELECTOR", 'button[type="submit"]')
+SUBMIT_SELECTOR   = os.getenv("SUBMIT_SELECTOR", '#warn-me')
 SUCCESS_INDICATOR = os.getenv("SUCCESS_INDICATOR", "")
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_SEC", "30"))
-LOGIN_TIMEOUT     = int(os.getenv("LOGIN_TIMEOUT_MS", "15000")) / 1000
-NAV_TIMEOUT       = int(os.getenv("NAV_TIMEOUT_MS", "30000")) / 1000
+LOGIN_TIMEOUT     = float(os.getenv("LOGIN_TIMEOUT_MS", "15000")) / 1000
+NAV_TIMEOUT       = float(os.getenv("NAV_TIMEOUT_MS", "30000")) / 1000
 CDP_PORT          = int(os.getenv("CDP_PORT", "9222"))
 PROFILE_DIR       = os.getenv("USER_DATA_DIR", str(Path(__file__).parent / ".edge_profile"))
 
@@ -63,7 +62,7 @@ def _stop(signum, frame):
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
-# ── Localiza o executável do Edge ─────────────────────────────────────────────
+# ── Localiza Edge ─────────────────────────────────────────────────────────────
 def find_edge():
     candidates = [
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -73,107 +72,62 @@ def find_edge():
     for path in candidates:
         if os.path.isfile(path):
             return path
-    raise FileNotFoundError("msedge.exe não encontrado. Verifique se o Edge está instalado.")
+    raise FileNotFoundError("msedge.exe não encontrado.")
 
-# ── CDP helpers ───────────────────────────────────────────────────────────────
+# ── CDP HTTP helpers ──────────────────────────────────────────────────────────
 def cdp_get(path):
     import urllib.request
-    url = f"http://127.0.0.1:{CDP_PORT}{path}"
-    with urllib.request.urlopen(url, timeout=5) as r:
+    with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}{path}", timeout=5) as r:
         return json.loads(r.read())
 
-def cdp_ws_send(ws_url, method, params=None):
-    """Envia um comando CDP via WebSocket e retorna a resposta."""
-    import urllib.request, urllib.parse, hashlib, base64, struct, socket
-    # Faz o handshake WebSocket manualmente (sem lib externa)
-    parsed = urllib.parse.urlparse(ws_url)
-    host = parsed.hostname
-    port = parsed.port or 80
-    path = parsed.path
-    if parsed.query:
-        path += "?" + parsed.query
-
-    key = base64.b64encode(os.urandom(16)).decode()
-    handshake = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        f"Upgrade: websocket\r\n"
-        f"Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        f"Sec-WebSocket-Version: 13\r\n\r\n"
-    ).encode()
-
-    sock = socket.create_connection((host, port), timeout=10)
-    sock.sendall(handshake)
-    resp = b""
-    while b"\r\n\r\n" not in resp:
-        resp += sock.recv(4096)
-
-    # Envia frame WebSocket (texto, sem máscara de servidor→cliente mas com máscara cliente→servidor)
-    payload = json.dumps({"id": 1, "method": method, "params": params or {}}).encode()
-    length = len(payload)
-    mask = os.urandom(4)
-    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-    frame = bytes([0x81, 0x80 | (length if length < 126 else 126)]) + \
-            (struct.pack(">H", length) if length >= 126 else b"") + \
-            mask + masked
-    sock.sendall(frame)
-
-    # Lê resposta
-    raw = b""
-    sock.settimeout(10)
+def get_page_tab():
+    """Retorna a primeira aba do tipo 'page'."""
     try:
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            raw += chunk
-            if len(raw) > 2:
-                break
+        for tab in cdp_get("/json/list"):
+            if tab.get("type") == "page":
+                return tab
     except Exception:
         pass
-    sock.close()
-    return True  # não precisamos do retorno para navegação
+    return None
 
-
-def get_tabs():
+# ── CDP WebSocket via websocket-client ────────────────────────────────────────
+def cdp_ws_exec(ws_url, commands):
+    """
+    Executa uma lista de comandos CDP via WebSocket.
+    commands: lista de (method, params_dict)
+    """
+    import websocket  # websocket-client
+    ws = websocket.create_connection(ws_url, timeout=10)
     try:
-        return cdp_get("/json/list")
-    except Exception:
-        return []
+        for i, (method, params) in enumerate(commands, start=1):
+            msg = json.dumps({"id": i, "method": method, "params": params})
+            ws.send(msg)
+            # Aguarda resposta com o id correspondente
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                raw = ws.recv()
+                data = json.loads(raw)
+                if data.get("id") == i:
+                    if "error" in data:
+                        log.warning("CDP erro id=%d: %s", i, data["error"])
+                    break
+    finally:
+        ws.close()
 
+def js(ws_url, expression):
+    """Executa JavaScript na aba."""
+    log.debug("JS: %s", expression[:80])
+    cdp_ws_exec(ws_url, [
+        ("Runtime.evaluate", {"expression": expression, "awaitPromise": False})
+    ])
 
-def get_active_url():
-    tabs = get_tabs()
-    for tab in tabs:
-        if tab.get("type") == "page":
-            return tab.get("url", ""), tab.get("webSocketDebuggerUrl", "")
-    return "", ""
+def navigate_cdp(ws_url, url):
+    """Navega para uma URL via CDP."""
+    log.info("Navegando para: %s", url)
+    cdp_ws_exec(ws_url, [("Page.navigate", {"url": url})])
+    time.sleep(3)
 
-
-def navigate(ws_url, url):
-    try:
-        cdp_ws_send(ws_url, "Page.navigate", {"url": url})
-        time.sleep(3)
-        return True
-    except Exception as exc:
-        log.error("Erro ao navegar via CDP: %s", exc)
-        return False
-
-
-def js_eval(ws_url, expression):
-    try:
-        cdp_ws_send(ws_url, "Runtime.evaluate", {
-            "expression": expression,
-            "awaitPromise": False
-        })
-        return True
-    except Exception as exc:
-        log.error("Erro ao executar JS: %s", exc)
-        return False
-
-
-# ── Inicia / reconecta o Edge ────────────────────────────────────────────────
+# ── Edge: inicia e verifica ───────────────────────────────────────────────────
 def start_edge():
     global _edge_proc
     edge_exe = find_edge()
@@ -187,9 +141,8 @@ def start_edge():
         "--noerrdialogs",
         "--disable-session-crashed-bubble",
         "--kiosk",
-        TARGET_URL,
+        LOGIN_URL,
     ])
-    # Aguarda Edge abrir e expor o CDP
     for _ in range(20):
         time.sleep(1)
         try:
@@ -198,9 +151,8 @@ def start_edge():
             return True
         except Exception:
             pass
-    log.error("Edge não respondeu ao CDP após 20 segundos.")
+    log.error("Edge não respondeu ao CDP.")
     return False
-
 
 def is_edge_running():
     if _edge_proc and _edge_proc.poll() is None:
@@ -211,72 +163,80 @@ def is_edge_running():
             pass
     return False
 
-
-# ── Login ────────────────────────────────────────────────────────────────────
-def do_login(ws_url_before_nav):
-    log.info("Navegando para login: %s", LOGIN_URL)
-    # Pega aba ativa
-    _, ws_url = get_active_url()
-    if not ws_url:
-        log.error("Nenhuma aba disponível para login.")
+# ── Login ─────────────────────────────────────────────────────────────────────
+def do_login():
+    log.info("Iniciando login em: %s", LOGIN_URL)
+    tab = get_page_tab()
+    if not tab:
+        log.error("Nenhuma aba disponível.")
         return False
 
-    navigate(ws_url, LOGIN_URL)
+    ws_url = tab["webSocketDebuggerUrl"]
+
+    # Navega para o login
+    navigate_cdp(ws_url, LOGIN_URL)
     time.sleep(2)
-    _, ws_url = get_active_url()
-    if not ws_url:
+
+    # Recarrega o ws_url (pode mudar após navegação)
+    tab = get_page_tab()
+    if not tab:
+        log.error("Aba sumiu após navegação.")
+        return False
+    ws_url = tab["webSocketDebuggerUrl"]
+
+    def esc(s):
+        return s.replace("\\", "\\\\").replace("'", "\\'")
+
+    # Preenche campos e clica
+    try:
+        js(ws_url, f"document.querySelector('{USERNAME_SELECTOR}').value = '{esc(USERNAME)}'")
+        time.sleep(0.5)
+        js(ws_url, f"document.querySelector('{PASSWORD_SELECTOR}').value = '{esc(PASSWORD)}'")
+        time.sleep(0.5)
+        js(ws_url, f"document.querySelector('{SUBMIT_SELECTOR}').click()")
+        time.sleep(3)
+    except Exception as exc:
+        log.error("Erro durante login: %s", exc)
         return False
 
-    def q(s):
-        return s.replace("'", "\\'")
-
-    ok = all([
-        js_eval(ws_url, f"document.querySelector('{q(USERNAME_SELECTOR)}').value = '{q(USERNAME)}'"),
-        js_eval(ws_url, f"document.querySelector('{q(PASSWORD_SELECTOR)}').value = '{q(PASSWORD)}'"),
-        js_eval(ws_url, f"document.querySelector('{q(SUBMIT_SELECTOR)}').click()"),
-    ])
-    if not ok:
-        log.error("Falha ao preencher formulário de login.")
-        return False
-
-    time.sleep(3)
-    url_after, _ = get_active_url()
-    log.info("Após login, URL: %s", url_after)
+    tab = get_page_tab()
+    url_after = tab.get("url", "") if tab else ""
+    log.info("URL após login: %s", url_after)
     return True
 
-
-# ── Verificação e recuperação ─────────────────────────────────────────────────
+# ── Verificação ───────────────────────────────────────────────────────────────
 def current_url_matches():
-    url, _ = get_active_url()
+    tab = get_page_tab()
+    if not tab:
+        return False
+    url = tab.get("url", "")
     match = url.startswith(TARGET_URL)
     if not match and url:
         log.warning("URL incorreta: '%s'", url)
-    return match, url
-
+    return match
 
 def recover():
     log.info("=== Iniciando recuperação ===")
-    _, ws_url = get_active_url()
-    if ws_url:
-        navigate(ws_url, TARGET_URL)
-        time.sleep(3)
-        match, url = current_url_matches()
-        if match:
+
+    # Tenta ir direto para o alvo
+    tab = get_page_tab()
+    if tab:
+        navigate_cdp(tab["webSocketDebuggerUrl"], TARGET_URL)
+        if current_url_matches():
             log.info("Recuperado sem login.")
             return True
 
-    # Precisa login
-    do_login(ws_url)
+    # Faz login e vai ao alvo
+    do_login()
     time.sleep(2)
-    _, ws_url = get_active_url()
-    if ws_url:
-        navigate(ws_url, TARGET_URL)
-        time.sleep(3)
+    tab = get_page_tab()
+    if tab:
+        navigate_cdp(tab["webSocketDebuggerUrl"], TARGET_URL)
+        time.sleep(2)
 
-    match, _ = current_url_matches()
-    log.info("=== Recuperação %s ===", "OK" if match else "falhou")
-    return match
-
+    success = current_url_matches()
+    log.info("=== Recuperação %s ===", "OK" if success else "falhou")
+    return success
 
 # ── Loop principal ────────────────────────────────────────────────────────────
 def run_monitor():
@@ -286,14 +246,13 @@ def run_monitor():
         if not start_edge():
             sys.exit(1)
     else:
-        log.info("Edge já está em execução.")
+        log.info("Edge já em execução.")
 
     time.sleep(2)
-    match, url = current_url_matches()
-    if not match:
+    if not current_url_matches():
         recover()
     else:
-        log.info("Telão já está na página correta: %s", url)
+        log.info("Telão já na página correta.")
 
     while _running:
         time.sleep(CHECK_INTERVAL)
@@ -304,9 +263,10 @@ def run_monitor():
                 log.warning("Edge fechou. Reiniciando...")
                 start_edge()
                 time.sleep(2)
+                recover()
+                continue
 
-            match, _ = current_url_matches()
-            if not match:
+            if not current_url_matches():
                 recover()
             else:
                 log.debug("OK")
@@ -314,7 +274,6 @@ def run_monitor():
             log.error("Erro inesperado: %s", exc)
 
     log.info("Monitor encerrado.")
-
 
 if __name__ == "__main__":
     run_monitor()
