@@ -1,9 +1,6 @@
 """
-Monitor de Telão - Verifica se o browser está na página correta e
-faz login automático se necessário.
-
-Uso: python monitor.py
-Configuração: copie .env.example para .env e preencha as variáveis.
+Monitor de Telão - Selenium edition (compatível com Python 3.10 / Windows Store)
+Verifica se o browser está na página correta e faz login automático se necessário.
 """
 
 import os
@@ -14,7 +11,6 @@ import signal
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ── Configuração de logging ──────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent / "logs"
@@ -37,18 +33,16 @@ TARGET_URL        = os.getenv("TARGET_URL", "")
 LOGIN_URL         = os.getenv("LOGIN_URL", TARGET_URL)
 USERNAME          = os.getenv("TELAO_USERNAME", "")
 PASSWORD          = os.getenv("TELAO_PASSWORD", "")
-USERNAME_SELECTOR = os.getenv("USERNAME_SELECTOR", 'input[name="username"], input[type="text"], #username')
-PASSWORD_SELECTOR = os.getenv("PASSWORD_SELECTOR", 'input[name="password"], input[type="password"], #password')
-SUBMIT_SELECTOR   = os.getenv("SUBMIT_SELECTOR", 'button[type="submit"], input[type="submit"]')
-SUCCESS_INDICATOR = os.getenv("SUCCESS_INDICATOR", "")   # seletor CSS ou texto que confirma login OK
+USERNAME_SELECTOR = os.getenv("USERNAME_SELECTOR", 'input[name="login"]')
+PASSWORD_SELECTOR = os.getenv("PASSWORD_SELECTOR", 'input[name="senha"]')
+SUBMIT_SELECTOR   = os.getenv("SUBMIT_SELECTOR", 'button[type="submit"]')
+SUCCESS_INDICATOR = os.getenv("SUCCESS_INDICATOR", "")
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_SEC", "30"))
-LOGIN_TIMEOUT     = int(os.getenv("LOGIN_TIMEOUT_MS", "15000"))
-NAV_TIMEOUT       = int(os.getenv("NAV_TIMEOUT_MS", "30000"))
+LOGIN_TIMEOUT     = int(os.getenv("LOGIN_TIMEOUT_MS", "15000")) / 1000
+NAV_TIMEOUT       = int(os.getenv("NAV_TIMEOUT_MS", "30000")) / 1000
 HEADLESS          = os.getenv("HEADLESS", "false").lower() == "true"
-USER_DATA_DIR     = os.getenv("USER_DATA_DIR", str(Path(__file__).parent / ".browser_profile"))
-CDP_URL           = os.getenv("CDP_URL", "")   # ex: http://localhost:9222  (deixe vazio para lançar browser novo)
+BROWSER           = os.getenv("BROWSER", "edge").lower()  # edge ou chrome
 
-# ── Validação básica ─────────────────────────────────────────────────────────
 if not TARGET_URL:
     log.error("TARGET_URL não configurada. Edite o arquivo .env antes de continuar.")
     sys.exit(1)
@@ -58,168 +52,179 @@ _running = True
 
 def _stop(signum, frame):
     global _running
-    log.info("Sinal de parada recebido. Encerrando monitoramento...")
+    log.info("Sinal de parada recebido. Encerrando...")
     _running = False
 
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Cria o driver ────────────────────────────────────────────────────────────
+def create_driver():
+    from selenium import webdriver
+    from selenium.webdriver.edge.service import Service as EdgeService
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from webdriver_manager.microsoft import EdgeChromiumDriverManager
+    from webdriver_manager.chrome import ChromeDriverManager
 
-def current_url_matches(page) -> bool:
-    """Retorna True se a URL atual começa com TARGET_URL."""
-    url = page.url
+    if BROWSER == "chrome":
+        opts = webdriver.ChromeOptions()
+        if HEADLESS:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--start-fullscreen")
+        opts.add_argument("--disable-infobars")
+        opts.add_argument("--noerrdialogs")
+        opts.add_argument("--kiosk")
+        driver = webdriver.Chrome(
+            service=ChromeService(ChromeDriverManager().install()),
+            options=opts,
+        )
+    else:
+        opts = webdriver.EdgeOptions()
+        if HEADLESS:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--start-fullscreen")
+        opts.add_argument("--disable-infobars")
+        opts.add_argument("--noerrdialogs")
+        opts.add_argument("--kiosk")
+        driver = webdriver.Edge(
+            service=EdgeService(EdgeChromiumDriverManager().install()),
+            options=opts,
+        )
+
+    driver.set_page_load_timeout(NAV_TIMEOUT)
+    return driver
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def current_url_matches(driver) -> bool:
+    url = driver.current_url
     match = url.startswith(TARGET_URL)
     if not match:
         log.warning("URL incorreta: '%s' (esperado começar com '%s')", url, TARGET_URL)
     return match
 
 
-def do_login(page) -> bool:
-    """Navega até LOGIN_URL, preenche credenciais e submete o formulário.
-    Retorna True em caso de sucesso."""
-    log.info("Navegando para a página de login: %s", LOGIN_URL)
-    try:
-        page.goto(LOGIN_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-    except PlaywrightTimeout:
-        log.error("Timeout ao carregar a página de login.")
-        return False
-
-    # Preenche usuário
-    try:
-        page.fill(USERNAME_SELECTOR, USERNAME, timeout=LOGIN_TIMEOUT)
-    except Exception as exc:
-        log.error("Não encontrou o campo de usuário (%s): %s", USERNAME_SELECTOR, exc)
-        return False
-
-    # Preenche senha
-    try:
-        page.fill(PASSWORD_SELECTOR, PASSWORD, timeout=LOGIN_TIMEOUT)
-    except Exception as exc:
-        log.error("Não encontrou o campo de senha (%s): %s", PASSWORD_SELECTOR, exc)
-        return False
-
-    # Submete
-    try:
-        page.click(SUBMIT_SELECTOR, timeout=LOGIN_TIMEOUT)
-    except Exception as exc:
-        log.error("Não encontrou o botão de submit (%s): %s", SUBMIT_SELECTOR, exc)
-        return False
-
-    # Aguarda navegação
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
-    except PlaywrightTimeout:
-        log.warning("Timeout aguardando carregamento após login.")
-
-    # Verifica indicador de sucesso opcional
-    if SUCCESS_INDICATOR:
+def find_element(driver, css_selector, timeout=10):
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    # Tenta cada seletor separado por vírgula
+    for sel in [s.strip() for s in css_selector.split(",")]:
         try:
-            page.wait_for_selector(SUCCESS_INDICATOR, timeout=LOGIN_TIMEOUT)
-            log.info("Login confirmado pelo indicador de sucesso.")
-        except PlaywrightTimeout:
-            log.error("Indicador de sucesso não encontrado após login ('%s').", SUCCESS_INDICATOR)
+            el = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+            )
+            return el
+        except Exception:
+            continue
+    return None
+
+
+def do_login(driver) -> bool:
+    log.info("Navegando para login: %s", LOGIN_URL)
+    try:
+        driver.get(LOGIN_URL)
+    except Exception as exc:
+        log.error("Erro ao carregar login: %s", exc)
+        return False
+
+    user_field = find_element(driver, USERNAME_SELECTOR, LOGIN_TIMEOUT)
+    if not user_field:
+        log.error("Campo de usuário não encontrado (%s)", USERNAME_SELECTOR)
+        return False
+    user_field.clear()
+    user_field.send_keys(USERNAME)
+
+    pass_field = find_element(driver, PASSWORD_SELECTOR, LOGIN_TIMEOUT)
+    if not pass_field:
+        log.error("Campo de senha não encontrado (%s)", PASSWORD_SELECTOR)
+        return False
+    pass_field.clear()
+    pass_field.send_keys(PASSWORD)
+
+    submit = find_element(driver, SUBMIT_SELECTOR, LOGIN_TIMEOUT)
+    if not submit:
+        log.error("Botão de submit não encontrado (%s)", SUBMIT_SELECTOR)
+        return False
+    submit.click()
+
+    time.sleep(3)  # aguarda redirecionamento
+
+    if SUCCESS_INDICATOR:
+        el = find_element(driver, SUCCESS_INDICATOR, LOGIN_TIMEOUT)
+        if not el:
+            log.error("Indicador de sucesso não encontrado após login.")
             return False
 
-    log.info("Login realizado. URL atual: %s", page.url)
+    log.info("Login realizado. URL: %s", driver.current_url)
     return True
 
 
-def navigate_to_target(page) -> bool:
-    """Navega para TARGET_URL."""
-    log.info("Navegando para a página alvo: %s", TARGET_URL)
+def navigate_to_target(driver) -> bool:
+    log.info("Navegando para: %s", TARGET_URL)
     try:
-        page.goto(TARGET_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-        log.info("Navegação concluída. URL: %s", page.url)
+        driver.get(TARGET_URL)
+        log.info("Navegação OK. URL: %s", driver.current_url)
         return True
-    except PlaywrightTimeout:
-        log.error("Timeout ao navegar para '%s'.", TARGET_URL)
-        return False
     except Exception as exc:
-        log.error("Erro ao navegar para '%s': %s", TARGET_URL, exc)
+        log.error("Erro ao navegar: %s", exc)
         return False
 
 
-def recover(page):
-    """Tenta recuperar o telão: faz login (se necessário) e navega para a URL alvo."""
+def recover(driver):
     log.info("=== Iniciando recuperação do telão ===")
+    if navigate_to_target(driver) and current_url_matches(driver):
+        log.info("Recuperado sem precisar de login.")
+        return True
 
-    # Se já estamos em alguma URL do sistema, tenta ir direto para o alvo
-    if navigate_to_target(page):
-        if current_url_matches(page):
-            log.info("Recuperação bem-sucedida sem login.")
-            return True
-
-    # Precisa de login
-    if not do_login(page):
-        log.error("Falha no login. Será tentado novamente no próximo ciclo.")
+    if not do_login(driver):
+        log.error("Falha no login. Tentará novamente no próximo ciclo.")
         return False
 
-    # Após login, garante que está na página alvo
-    if not current_url_matches(page):
-        navigate_to_target(page)
+    if not current_url_matches(driver):
+        navigate_to_target(driver)
 
-    success = current_url_matches(page)
-    if success:
-        log.info("=== Telão recuperado com sucesso ===")
-    else:
-        log.error("=== Não foi possível recuperar o telão neste ciclo ===")
+    success = current_url_matches(driver)
+    log.info("=== Recuperação %s ===", "bem-sucedida" if success else "falhou")
     return success
 
 
 # ── Loop principal ───────────────────────────────────────────────────────────
-
 def run_monitor():
-    log.info("Iniciando monitor de telão | TARGET_URL=%s | intervalo=%ds", TARGET_URL, CHECK_INTERVAL)
+    log.info("Iniciando monitor | TARGET=%s | intervalo=%ds | browser=%s",
+             TARGET_URL, CHECK_INTERVAL, BROWSER)
 
-    with sync_playwright() as pw:
-        # ── Conecta a browser existente via CDP ou lança um novo ──────────────
-        if CDP_URL:
-            log.info("Conectando ao browser existente via CDP: %s", CDP_URL)
-            browser = pw.chromium.connect_over_cdp(CDP_URL)
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
+    driver = create_driver()
+
+    try:
+        if not current_url_matches(driver):
+            recover(driver)
         else:
-            log.info("Lançando browser Chromium (persistente, headless=%s)", HEADLESS)
-            context = pw.chromium.launch_persistent_context(
-                user_data_dir=USER_DATA_DIR,
-                headless=HEADLESS,
-                no_viewport=True,
-                args=["--start-fullscreen", "--disable-infobars", "--noerrdialogs",
-                      "--disable-session-crashed-bubble", "--kiosk"],
-            )
+            log.info("Telão já está na página correta.")
 
-        # ── Garante que existe ao menos uma aba ──────────────────────────────
-        page = context.pages[0] if context.pages else context.new_page()
-
-        # Primeira navegação
-        if not current_url_matches(page):
-            recover(page)
-        else:
-            log.info("Telão já está na página correta: %s", page.url)
-
-        # ── Loop de monitoramento ─────────────────────────────────────────────
         while _running:
             time.sleep(CHECK_INTERVAL)
             if not _running:
                 break
-
             try:
-                if not current_url_matches(page):
-                    recover(page)
+                if not current_url_matches(driver):
+                    recover(driver)
                 else:
-                    log.debug("OK | %s", page.url)
+                    log.debug("OK | %s", driver.current_url)
             except Exception as exc:
-                log.error("Erro inesperado durante verificação: %s", exc)
-                # Tenta reabrir a aba
+                log.error("Erro inesperado: %s", exc)
                 try:
-                    page = context.new_page()
-                    recover(page)
-                except Exception as exc2:
-                    log.error("Falha ao reabrir aba: %s", exc2)
+                    driver.quit()
+                except Exception:
+                    pass
+                log.info("Reiniciando browser...")
+                driver = create_driver()
+                recover(driver)
 
+    finally:
         log.info("Monitor encerrado.")
         try:
-            context.close()
+            driver.quit()
         except Exception:
             pass
 
