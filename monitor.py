@@ -1,13 +1,17 @@
 """
-Monitor de Telão - Selenium edition (compatível com Python 3.10 / Windows Store)
-Verifica se o browser está na página correta e faz login automático se necessário.
+Monitor de Telão - CDP edition
+Controla o Edge via Chrome DevTools Protocol (porta 9222).
+Não precisa de driver externo nem download adicional.
 """
 
 import os
 import sys
 import time
+import json
 import logging
 import signal
+import subprocess
+import glob
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -40,8 +44,8 @@ SUCCESS_INDICATOR = os.getenv("SUCCESS_INDICATOR", "")
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_SEC", "30"))
 LOGIN_TIMEOUT     = int(os.getenv("LOGIN_TIMEOUT_MS", "15000")) / 1000
 NAV_TIMEOUT       = int(os.getenv("NAV_TIMEOUT_MS", "30000")) / 1000
-HEADLESS          = os.getenv("HEADLESS", "false").lower() == "true"
-BROWSER           = os.getenv("BROWSER", "edge").lower()  # edge ou chrome
+CDP_PORT          = int(os.getenv("CDP_PORT", "9222"))
+PROFILE_DIR       = os.getenv("USER_DATA_DIR", str(Path(__file__).parent / ".edge_profile"))
 
 if not TARGET_URL:
     log.error("TARGET_URL não configurada. Edite o arquivo .env antes de continuar.")
@@ -49,220 +53,267 @@ if not TARGET_URL:
 
 # ── Sinal de parada ──────────────────────────────────────────────────────────
 _running = True
+_edge_proc = None
 
 def _stop(signum, frame):
     global _running
-    log.info("Sinal de parada recebido. Encerrando...")
+    log.info("Encerrando monitor...")
     _running = False
 
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
-# ── Localiza driver localmente ───────────────────────────────────────────────
-def _find_local_driver(name):
-    """Procura o driver executável em locais conhecidos."""
-    import glob, shutil
+# ── Localiza o executável do Edge ─────────────────────────────────────────────
+def find_edge():
     candidates = [
-        os.path.join(os.path.dirname(__file__), name),          # pasta do projeto
-        os.path.join(os.path.expanduser("~"), name),             # home do usuário
-        r"C:\\" + name,
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     ]
-    # Busca na pasta de instalação do Edge/Chrome
-    candidates += glob.glob(r"C:\Program Files*\Microsoft\Edge\Application\*\\" + name)
-    candidates += glob.glob(r"C:\Program Files*\Google\Chrome\Application\*\\" + name)
-    # PATH
-    found = shutil.which(name)
-    if found:
-        candidates.insert(0, found)
+    candidates += glob.glob(r"C:\Program Files*\Microsoft\Edge\Application\msedge.exe")
     for path in candidates:
         if os.path.isfile(path):
-            log.info("Driver encontrado: %s", path)
             return path
-    return None
+    raise FileNotFoundError("msedge.exe não encontrado. Verifique se o Edge está instalado.")
 
-# ── Cria o driver ────────────────────────────────────────────────────────────
-def create_driver():
-    from selenium import webdriver
-    from selenium.webdriver.edge.service import Service as EdgeService
-    from selenium.webdriver.chrome.service import Service as ChromeService
+# ── CDP helpers ───────────────────────────────────────────────────────────────
+def cdp_get(path):
+    import urllib.request
+    url = f"http://127.0.0.1:{CDP_PORT}{path}"
+    with urllib.request.urlopen(url, timeout=5) as r:
+        return json.loads(r.read())
 
-    DRIVER_PATH = os.getenv("DRIVER_PATH", "")
+def cdp_ws_send(ws_url, method, params=None):
+    """Envia um comando CDP via WebSocket e retorna a resposta."""
+    import urllib.request, urllib.parse, hashlib, base64, struct, socket
+    # Faz o handshake WebSocket manualmente (sem lib externa)
+    parsed = urllib.parse.urlparse(ws_url)
+    host = parsed.hostname
+    port = parsed.port or 80
+    path = parsed.path
+    if parsed.query:
+        path += "?" + parsed.query
 
-    if BROWSER == "chrome":
-        opts = webdriver.ChromeOptions()
-        if HEADLESS:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--start-fullscreen")
-        opts.add_argument("--disable-infobars")
-        opts.add_argument("--noerrdialogs")
-        opts.add_argument("--kiosk")
-        driver_path = DRIVER_PATH or _find_local_driver("chromedriver.exe")
-        if driver_path:
-            driver = webdriver.Chrome(service=ChromeService(driver_path), options=opts)
-        else:
-            log.info("chromedriver não encontrado localmente, usando Selenium Manager...")
-            driver = webdriver.Chrome(options=opts)
-    else:
-        opts = webdriver.EdgeOptions()
-        if HEADLESS:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--start-fullscreen")
-        opts.add_argument("--disable-infobars")
-        opts.add_argument("--noerrdialogs")
-        opts.add_argument("--kiosk")
-        driver_path = DRIVER_PATH or _find_local_driver("msedgedriver.exe")
-        if driver_path:
-            driver = webdriver.Edge(service=EdgeService(driver_path), options=opts)
-        else:
-            log.info("msedgedriver não encontrado localmente, usando Selenium Manager...")
-            try:
-                driver = webdriver.Edge(options=opts)
-            except Exception as exc:
-                log.error("Falha ao iniciar Edge via Selenium Manager: %s", exc)
-                log.error("")
-                log.error("A rede bloqueou o download automático do driver.")
-                log.error("Baixe o msedgedriver.exe manualmente em outro computador:")
-                log.error("  https://developer.microsoft.com/microsoft-edge/tools/webdriver/")
-                log.error("Versão do Edge: abra edge://version no navegador")
-                log.error("Depois coloque o msedgedriver.exe na pasta: %s", os.path.dirname(__file__))
-                sys.exit(1)
+    key = base64.b64encode(os.urandom(16)).decode()
+    handshake = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode()
 
-    driver.set_page_load_timeout(NAV_TIMEOUT)
-    return driver
+    sock = socket.create_connection((host, port), timeout=10)
+    sock.sendall(handshake)
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        resp += sock.recv(4096)
 
+    # Envia frame WebSocket (texto, sem máscara de servidor→cliente mas com máscara cliente→servidor)
+    payload = json.dumps({"id": 1, "method": method, "params": params or {}}).encode()
+    length = len(payload)
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    frame = bytes([0x81, 0x80 | (length if length < 126 else 126)]) + \
+            (struct.pack(">H", length) if length >= 126 else b"") + \
+            mask + masked
+    sock.sendall(frame)
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def current_url_matches(driver) -> bool:
-    url = driver.current_url
-    match = url.startswith(TARGET_URL)
-    if not match:
-        log.warning("URL incorreta: '%s' (esperado começar com '%s')", url, TARGET_URL)
-    return match
-
-
-def find_element(driver, css_selector, timeout=10):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    # Tenta cada seletor separado por vírgula
-    for sel in [s.strip() for s in css_selector.split(",")]:
-        try:
-            el = WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-            )
-            return el
-        except Exception:
-            continue
-    return None
-
-
-def do_login(driver) -> bool:
-    log.info("Navegando para login: %s", LOGIN_URL)
+    # Lê resposta
+    raw = b""
+    sock.settimeout(10)
     try:
-        driver.get(LOGIN_URL)
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 2:
+                break
+    except Exception:
+        pass
+    sock.close()
+    return True  # não precisamos do retorno para navegação
+
+
+def get_tabs():
+    try:
+        return cdp_get("/json/list")
+    except Exception:
+        return []
+
+
+def get_active_url():
+    tabs = get_tabs()
+    for tab in tabs:
+        if tab.get("type") == "page":
+            return tab.get("url", ""), tab.get("webSocketDebuggerUrl", "")
+    return "", ""
+
+
+def navigate(ws_url, url):
+    try:
+        cdp_ws_send(ws_url, "Page.navigate", {"url": url})
+        time.sleep(3)
+        return True
     except Exception as exc:
-        log.error("Erro ao carregar login: %s", exc)
+        log.error("Erro ao navegar via CDP: %s", exc)
         return False
 
-    user_field = find_element(driver, USERNAME_SELECTOR, LOGIN_TIMEOUT)
-    if not user_field:
-        log.error("Campo de usuário não encontrado (%s)", USERNAME_SELECTOR)
+
+def js_eval(ws_url, expression):
+    try:
+        cdp_ws_send(ws_url, "Runtime.evaluate", {
+            "expression": expression,
+            "awaitPromise": False
+        })
+        return True
+    except Exception as exc:
+        log.error("Erro ao executar JS: %s", exc)
         return False
-    user_field.clear()
-    user_field.send_keys(USERNAME)
 
-    pass_field = find_element(driver, PASSWORD_SELECTOR, LOGIN_TIMEOUT)
-    if not pass_field:
-        log.error("Campo de senha não encontrado (%s)", PASSWORD_SELECTOR)
+
+# ── Inicia / reconecta o Edge ────────────────────────────────────────────────
+def start_edge():
+    global _edge_proc
+    edge_exe = find_edge()
+    log.info("Iniciando Edge: %s", edge_exe)
+    _edge_proc = subprocess.Popen([
+        edge_exe,
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--user-data-dir={PROFILE_DIR}",
+        "--start-fullscreen",
+        "--disable-infobars",
+        "--noerrdialogs",
+        "--disable-session-crashed-bubble",
+        "--kiosk",
+        TARGET_URL,
+    ])
+    # Aguarda Edge abrir e expor o CDP
+    for _ in range(20):
+        time.sleep(1)
+        try:
+            cdp_get("/json/version")
+            log.info("Edge iniciado e CDP disponível.")
+            return True
+        except Exception:
+            pass
+    log.error("Edge não respondeu ao CDP após 20 segundos.")
+    return False
+
+
+def is_edge_running():
+    if _edge_proc and _edge_proc.poll() is None:
+        try:
+            cdp_get("/json/version")
+            return True
+        except Exception:
+            pass
+    return False
+
+
+# ── Login ────────────────────────────────────────────────────────────────────
+def do_login(ws_url_before_nav):
+    log.info("Navegando para login: %s", LOGIN_URL)
+    # Pega aba ativa
+    _, ws_url = get_active_url()
+    if not ws_url:
+        log.error("Nenhuma aba disponível para login.")
         return False
-    pass_field.clear()
-    pass_field.send_keys(PASSWORD)
 
-    submit = find_element(driver, SUBMIT_SELECTOR, LOGIN_TIMEOUT)
-    if not submit:
-        log.error("Botão de submit não encontrado (%s)", SUBMIT_SELECTOR)
+    navigate(ws_url, LOGIN_URL)
+    time.sleep(2)
+    _, ws_url = get_active_url()
+    if not ws_url:
         return False
-    submit.click()
 
-    time.sleep(3)  # aguarda redirecionamento
+    def q(s):
+        return s.replace("'", "\\'")
 
-    if SUCCESS_INDICATOR:
-        el = find_element(driver, SUCCESS_INDICATOR, LOGIN_TIMEOUT)
-        if not el:
-            log.error("Indicador de sucesso não encontrado após login.")
-            return False
+    ok = all([
+        js_eval(ws_url, f"document.querySelector('{q(USERNAME_SELECTOR)}').value = '{q(USERNAME)}'"),
+        js_eval(ws_url, f"document.querySelector('{q(PASSWORD_SELECTOR)}').value = '{q(PASSWORD)}'"),
+        js_eval(ws_url, f"document.querySelector('{q(SUBMIT_SELECTOR)}').click()"),
+    ])
+    if not ok:
+        log.error("Falha ao preencher formulário de login.")
+        return False
 
-    log.info("Login realizado. URL: %s", driver.current_url)
+    time.sleep(3)
+    url_after, _ = get_active_url()
+    log.info("Após login, URL: %s", url_after)
     return True
 
 
-def navigate_to_target(driver) -> bool:
-    log.info("Navegando para: %s", TARGET_URL)
-    try:
-        driver.get(TARGET_URL)
-        log.info("Navegação OK. URL: %s", driver.current_url)
-        return True
-    except Exception as exc:
-        log.error("Erro ao navegar: %s", exc)
-        return False
+# ── Verificação e recuperação ─────────────────────────────────────────────────
+def current_url_matches():
+    url, _ = get_active_url()
+    match = url.startswith(TARGET_URL)
+    if not match and url:
+        log.warning("URL incorreta: '%s'", url)
+    return match, url
 
 
-def recover(driver):
-    log.info("=== Iniciando recuperação do telão ===")
-    if navigate_to_target(driver) and current_url_matches(driver):
-        log.info("Recuperado sem precisar de login.")
-        return True
+def recover():
+    log.info("=== Iniciando recuperação ===")
+    _, ws_url = get_active_url()
+    if ws_url:
+        navigate(ws_url, TARGET_URL)
+        time.sleep(3)
+        match, url = current_url_matches()
+        if match:
+            log.info("Recuperado sem login.")
+            return True
 
-    if not do_login(driver):
-        log.error("Falha no login. Tentará novamente no próximo ciclo.")
-        return False
+    # Precisa login
+    do_login(ws_url)
+    time.sleep(2)
+    _, ws_url = get_active_url()
+    if ws_url:
+        navigate(ws_url, TARGET_URL)
+        time.sleep(3)
 
-    if not current_url_matches(driver):
-        navigate_to_target(driver)
-
-    success = current_url_matches(driver)
-    log.info("=== Recuperação %s ===", "bem-sucedida" if success else "falhou")
-    return success
+    match, _ = current_url_matches()
+    log.info("=== Recuperação %s ===", "OK" if match else "falhou")
+    return match
 
 
-# ── Loop principal ───────────────────────────────────────────────────────────
+# ── Loop principal ────────────────────────────────────────────────────────────
 def run_monitor():
-    log.info("Iniciando monitor | TARGET=%s | intervalo=%ds | browser=%s",
-             TARGET_URL, CHECK_INTERVAL, BROWSER)
+    log.info("Iniciando monitor | TARGET=%s | intervalo=%ds", TARGET_URL, CHECK_INTERVAL)
 
-    driver = create_driver()
+    if not is_edge_running():
+        if not start_edge():
+            sys.exit(1)
+    else:
+        log.info("Edge já está em execução.")
 
-    try:
-        if not current_url_matches(driver):
-            recover(driver)
-        else:
-            log.info("Telão já está na página correta.")
+    time.sleep(2)
+    match, url = current_url_matches()
+    if not match:
+        recover()
+    else:
+        log.info("Telão já está na página correta: %s", url)
 
-        while _running:
-            time.sleep(CHECK_INTERVAL)
-            if not _running:
-                break
-            try:
-                if not current_url_matches(driver):
-                    recover(driver)
-                else:
-                    log.debug("OK | %s", driver.current_url)
-            except Exception as exc:
-                log.error("Erro inesperado: %s", exc)
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                log.info("Reiniciando browser...")
-                driver = create_driver()
-                recover(driver)
-
-    finally:
-        log.info("Monitor encerrado.")
+    while _running:
+        time.sleep(CHECK_INTERVAL)
+        if not _running:
+            break
         try:
-            driver.quit()
-        except Exception:
-            pass
+            if not is_edge_running():
+                log.warning("Edge fechou. Reiniciando...")
+                start_edge()
+                time.sleep(2)
+
+            match, _ = current_url_matches()
+            if not match:
+                recover()
+            else:
+                log.debug("OK")
+        except Exception as exc:
+            log.error("Erro inesperado: %s", exc)
+
+    log.info("Monitor encerrado.")
 
 
 if __name__ == "__main__":
