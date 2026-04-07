@@ -58,13 +58,35 @@ def _stop(signum, frame):
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
+# ── Localiza driver localmente ───────────────────────────────────────────────
+def _find_local_driver(name):
+    """Procura o driver executável em locais conhecidos."""
+    import glob, shutil
+    candidates = [
+        os.path.join(os.path.dirname(__file__), name),          # pasta do projeto
+        os.path.join(os.path.expanduser("~"), name),             # home do usuário
+        r"C:\\" + name,
+    ]
+    # Busca na pasta de instalação do Edge/Chrome
+    candidates += glob.glob(r"C:\Program Files*\Microsoft\Edge\Application\*\\" + name)
+    candidates += glob.glob(r"C:\Program Files*\Google\Chrome\Application\*\\" + name)
+    # PATH
+    found = shutil.which(name)
+    if found:
+        candidates.insert(0, found)
+    for path in candidates:
+        if os.path.isfile(path):
+            log.info("Driver encontrado: %s", path)
+            return path
+    return None
+
 # ── Cria o driver ────────────────────────────────────────────────────────────
 def create_driver():
     from selenium import webdriver
     from selenium.webdriver.edge.service import Service as EdgeService
     from selenium.webdriver.chrome.service import Service as ChromeService
-    from webdriver_manager.microsoft import EdgeChromiumDriverManager
-    from webdriver_manager.chrome import ChromeDriverManager
+
+    DRIVER_PATH = os.getenv("DRIVER_PATH", "")
 
     if BROWSER == "chrome":
         opts = webdriver.ChromeOptions()
@@ -74,10 +96,12 @@ def create_driver():
         opts.add_argument("--disable-infobars")
         opts.add_argument("--noerrdialogs")
         opts.add_argument("--kiosk")
-        driver = webdriver.Chrome(
-            service=ChromeService(ChromeDriverManager().install()),
-            options=opts,
-        )
+        driver_path = DRIVER_PATH or _find_local_driver("chromedriver.exe")
+        if driver_path:
+            driver = webdriver.Chrome(service=ChromeService(driver_path), options=opts)
+        else:
+            log.info("chromedriver não encontrado localmente, usando Selenium Manager...")
+            driver = webdriver.Chrome(options=opts)
     else:
         opts = webdriver.EdgeOptions()
         if HEADLESS:
@@ -86,10 +110,22 @@ def create_driver():
         opts.add_argument("--disable-infobars")
         opts.add_argument("--noerrdialogs")
         opts.add_argument("--kiosk")
-        driver = webdriver.Edge(
-            service=EdgeService(EdgeChromiumDriverManager().install()),
-            options=opts,
-        )
+        driver_path = DRIVER_PATH or _find_local_driver("msedgedriver.exe")
+        if driver_path:
+            driver = webdriver.Edge(service=EdgeService(driver_path), options=opts)
+        else:
+            log.info("msedgedriver não encontrado localmente, usando Selenium Manager...")
+            try:
+                driver = webdriver.Edge(options=opts)
+            except Exception as exc:
+                log.error("Falha ao iniciar Edge via Selenium Manager: %s", exc)
+                log.error("")
+                log.error("A rede bloqueou o download automático do driver.")
+                log.error("Baixe o msedgedriver.exe manualmente em outro computador:")
+                log.error("  https://developer.microsoft.com/microsoft-edge/tools/webdriver/")
+                log.error("Versão do Edge: abra edge://version no navegador")
+                log.error("Depois coloque o msedgedriver.exe na pasta: %s", os.path.dirname(__file__))
+                sys.exit(1)
 
     driver.set_page_load_timeout(NAV_TIMEOUT)
     return driver
