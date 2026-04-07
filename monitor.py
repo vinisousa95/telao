@@ -153,6 +153,9 @@ def start_edge():
         "--disable-infobars",
         "--noerrdialogs",
         "--disable-session-crashed-bubble",
+        "--no-restore-last-session",
+        "--restore-last-session=0",
+        "--new-window",
         "--kiosk",
         LOGIN_URL,
     ])
