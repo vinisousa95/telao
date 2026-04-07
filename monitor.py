@@ -148,6 +148,7 @@ def start_edge():
     _edge_proc = subprocess.Popen([
         edge_exe,
         f"--remote-debugging-port={CDP_PORT}",
+        f"--remote-allow-origins=*",
         f"--user-data-dir={PROFILE_DIR}",
         "--start-fullscreen",
         "--disable-infobars",
