@@ -172,13 +172,12 @@ def start_edge():
     return False
 
 def is_edge_running():
-    if _edge_proc and _edge_proc.poll() is None:
-        try:
-            cdp_get("/json/version")
-            return True
-        except Exception:
-            pass
-    return False
+    """Verifica se o Edge está respondendo ao CDP, independente do processo."""
+    try:
+        cdp_get("/json/version")
+        return True
+    except Exception:
+        return False
 
 # ── Login ─────────────────────────────────────────────────────────────────────
 def do_login():
