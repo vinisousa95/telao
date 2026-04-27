@@ -45,6 +45,7 @@ LOGIN_TIMEOUT     = float(os.getenv("LOGIN_TIMEOUT_MS", "15000")) / 1000
 NAV_TIMEOUT       = float(os.getenv("NAV_TIMEOUT_MS", "30000")) / 1000
 CDP_PORT          = int(os.getenv("CDP_PORT", "9222"))
 PROFILE_DIR       = os.getenv("USER_DATA_DIR", str(Path(__file__).parent / ".edge_profile"))
+RELOAD_INTERVAL   = int(os.getenv("RELOAD_INTERVAL_SEC", "3600"))  # reload a cada 1h por padrão
 
 if not TARGET_URL:
     log.error("TARGET_URL não configurada. Edite o arquivo .env antes de continuar.")
@@ -54,6 +55,7 @@ if not TARGET_URL:
 _running = True
 _edge_proc = None
 _last_recovery = 0
+_last_reload = 0
 RECOVERY_COOLDOWN = 60  # segundos entre tentativas de recuperação
 
 def _stop(signum, frame):
@@ -261,6 +263,20 @@ def recover():
     log.info("=== Recuperação %s ===", "OK" if success else "falhou")
     return success
 
+# ── Reload periódico ─────────────────────────────────────────────────────────
+def _do_reload():
+    global _last_reload
+    _last_reload = time.time()
+    log.info("Reload periódico da página para liberar memória...")
+    tab = get_page_tab()
+    if tab:
+        try:
+            cdp_ws_exec(tab["webSocketDebuggerUrl"], [("Page.reload", {"ignoreCache": True})])
+            time.sleep(3)
+            log.info("Reload concluído. URL: %s", (get_page_tab() or {}).get("url", "?"))
+        except Exception as exc:
+            log.error("Erro no reload: %s", exc)
+
 # ── Loop principal ────────────────────────────────────────────────────────────
 def run_monitor():
     log.info("Iniciando monitor | TARGET=%s | intervalo=%ds", TARGET_URL, CHECK_INTERVAL)
@@ -292,7 +308,11 @@ def run_monitor():
             if not current_url_matches():
                 recover()
             else:
-                log.debug("OK")
+                # Reload periódico para evitar out of memory
+                if RELOAD_INTERVAL > 0 and (time.time() - _last_reload) >= RELOAD_INTERVAL:
+                    _do_reload()
+                else:
+                    log.debug("OK")
         except Exception as exc:
             log.error("Erro inesperado: %s", exc)
 
